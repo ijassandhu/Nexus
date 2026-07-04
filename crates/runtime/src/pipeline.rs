@@ -110,7 +110,7 @@ fn relevant_bets(
     Ok((cautions, beliefs, ids))
 }
 
-fn normalize_path(s: &str) -> String {
+pub(crate) fn normalize_path(s: &str) -> String {
     s.to_lowercase().replace('\\', "/").trim_start_matches("//?/").to_string()
 }
 
@@ -263,6 +263,9 @@ pub fn run_intent(
             "txn": meta.id,
             "effect_list": changes,
             "advisory_summary": out.plan.join("; "),
+            // S1: the premortems this task actually relied on. Automated
+            // settlement touches exactly these — not every in-scope bet.
+            "cited_premortems": cautions.iter().filter_map(|c| c["id"].as_str()).collect::<Vec<_>>(),
         }),
     );
     Blackboard::append(sub, &diff_art, Trust::Derived)?;

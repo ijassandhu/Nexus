@@ -38,6 +38,13 @@ pub struct RouteRule {
     pub max_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Preference-ordered alternates tried when the primary is unavailable
+    /// (no key) or fails at call time. Users who prefer local put e.g.
+    /// ollama first and a frontier provider here. Measured (cost/latency/
+    /// quality) selection stays deferred until scorecard data exists (D-016);
+    /// this is availability + user preference, nothing pretended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<RouteRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +74,7 @@ fn default_config() -> RouterConfig {
                 model: String::new(),
                 max_tokens: if tc == "worker.execute" { 8192 } else { 4096 },
                 base_url: None,
+                fallbacks: vec![],
             },
         );
     }
@@ -122,6 +130,11 @@ impl Router {
         Ok(None)
     }
 
+    /// Try the primary rule, then its fallbacks in preference order. A
+    /// candidate is skipped when unavailable (no resolvable key) and
+    /// abandoned when its call fails; every outcome is logged. The caller
+    /// never learns which provider answered except through the Completion's
+    /// model id — the rest of the system stays provider-blind.
     pub fn complete(
         &self,
         sub: &mut Substrate,
@@ -134,57 +147,82 @@ impl Router {
             .routes
             .get(task_class)
             .ok_or_else(|| anyhow!("no route for task class '{task_class}' in router.json"))?;
-        let provider_id = if self.force_mock { "mock" } else { rule.provider.as_str() };
-        if provider_id == "unconfigured" {
-            bail!("no model provider configured — run `nx configure` to choose one");
-        }
-        let provider = providers::get(provider_id)?;
-        let key = Self::resolve_key(sub, provider.as_ref())?;
+        let chain: Vec<&RouteRule> = std::iter::once(rule).chain(rule.fallbacks.iter()).collect();
 
-        let req = CompletionRequest {
-            task_class,
-            model: &rule.model,
-            system,
-            user,
-            max_tokens: rule.max_tokens,
-            base_url: rule.base_url.as_deref(),
-        };
-        let start = Instant::now();
-        let result = provider.complete(key.as_deref(), &req);
-        let ms = start.elapsed().as_millis();
+        let mut failures: Vec<String> = Vec::new();
+        for (attempt, r) in chain.iter().enumerate() {
+            let provider_id = if self.force_mock { "mock" } else { r.provider.as_str() };
+            if provider_id == "unconfigured" {
+                failures.push("unconfigured (run `nx configure`)".into());
+                continue;
+            }
+            let provider = providers::get(provider_id)?; // unknown id = config bug, hard error
+            let key = match Self::resolve_key(sub, provider.as_ref()) {
+                Ok(k) => k,
+                Err(e) => {
+                    failures.push(format!("{provider_id}: {e}"));
+                    continue;
+                }
+            };
 
-        let model_id = if provider_id == "mock" { "mock".to_string() } else { rule.model.clone() };
-        let (ok, out_hash) = match &result {
-            Ok(text) => (true, substrate::hex(blake3::hash(text.as_bytes()).as_bytes())),
-            Err(_) => (false, String::new()),
-        };
-        sub.append(
-            Kind::Action,
-            ROUTER_CALL_SCHEMA,
-            Origin { adapter: "runtime.router".into(), actor: task_class.into(), trust: Trust::Local },
-            Privacy::P1,
-            vec![],
-            serde_json::json!({
-                "task_class": task_class,
-                // Operator dimension for per-reasoner scorecards
-                // (COGNITIVE_ARCHITECTURE Part VIII).
-                "operator": match task_class {
-                    "worker.execute" => "deliberate",
-                    "critic.review" => "review",
-                    "archivist.appraise" => "appraise",
-                    _ => "unknown",
+            let req = CompletionRequest {
+                task_class,
+                model: &r.model,
+                system,
+                user,
+                max_tokens: r.max_tokens,
+                base_url: r.base_url.as_deref(),
+            };
+            let start = Instant::now();
+            let result = provider.complete(key.as_deref(), &req);
+            let ms = start.elapsed().as_millis();
+
+            let model_id =
+                if provider_id == "mock" { "mock".to_string() } else { r.model.clone() };
+            let (ok, out_hash) = match &result {
+                Ok(text) => (true, substrate::hex(blake3::hash(text.as_bytes()).as_bytes())),
+                Err(_) => (false, String::new()),
+            };
+            sub.append(
+                Kind::Action,
+                ROUTER_CALL_SCHEMA,
+                Origin {
+                    adapter: "runtime.router".into(),
+                    actor: task_class.into(),
+                    trust: Trust::Local,
                 },
-                "provider": provider_id,
-                "model": model_id,
-                "ms": ms as u64,
-                "ok": ok,
-                "out_hash": out_hash,
-            })
-            .to_string()
-            .as_bytes(),
-        )?;
+                Privacy::P1,
+                vec![],
+                serde_json::json!({
+                    "task_class": task_class,
+                    // Operator dimension for per-reasoner scorecards
+                    // (COGNITIVE_ARCHITECTURE Part VIII).
+                    "operator": match task_class {
+                        "worker.execute" => "deliberate",
+                        "critic.review" => "review",
+                        "archivist.appraise" => "appraise",
+                        _ => "unknown",
+                    },
+                    "provider": provider_id,
+                    "model": model_id,
+                    "attempt": attempt as u64,
+                    "ms": ms as u64,
+                    "ok": ok,
+                    "out_hash": out_hash,
+                })
+                .to_string()
+                .as_bytes(),
+            )?;
 
-        result.map(|text| Completion { text, model_id, ms })
+            match result {
+                Ok(text) => return Ok(Completion { text, model_id, ms }),
+                Err(e) => failures.push(format!("{provider_id}: {e}")),
+            }
+        }
+        bail!(
+            "no provider could serve '{task_class}': {}",
+            if failures.is_empty() { "empty route".to_string() } else { failures.join("; ") }
+        )
     }
 }
 
@@ -245,6 +283,34 @@ mod tests {
             Router::resolve_key(&sub, p.as_ref()).unwrap().as_deref(),
             Some("sk-or-sealed")
         );
+    }
+
+    #[test]
+    fn fallback_chain_skips_unavailable_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = Substrate::init(dir.path(), "pass").unwrap();
+        // Primary needs a key nobody has; fallback is the mock.
+        std::fs::write(
+            dir.path().join("router.json"),
+            r#"{"routes":{
+                "worker.execute":{"provider":"openrouter","model":"big","max_tokens":16,
+                    "fallbacks":[{"provider":"mock","model":"m","max_tokens":16}]},
+                "critic.review":{"provider":"mock","model":"m","max_tokens":16},
+                "archivist.appraise":{"provider":"mock","model":"m","max_tokens":16}}}"#,
+        )
+        .unwrap();
+        let router = Router::load(dir.path(), false).unwrap();
+        let c = router
+            .complete(&mut sub, "worker.execute", "s", r#"{"intent":"x"}"#)
+            .unwrap();
+        assert_eq!(c.model_id, "mock", "fell through to the available candidate");
+        // The successful call logged attempt index 1 (second candidate).
+        let (events, _) = sub.events(true).unwrap();
+        let call = events.iter().rev().find(|e| e.header.schema == ROUTER_CALL_SCHEMA).unwrap();
+        let substrate::BodyState::Plain(b) = &call.body else { panic!() };
+        let v: serde_json::Value = serde_json::from_slice(b).unwrap();
+        assert_eq!(v["attempt"], 1);
+        assert_eq!(v["ok"], true);
     }
 
     #[test]

@@ -166,6 +166,14 @@ Provenance = the event's `refs` (episode ids): no reliance without evidence. The
 its event id. Bets are the **sole** reliance representation — claims (§8) are deprecated per
 D-019; consolidation emits bets directly, through the admission rule.
 
+**Scope of the admission rule (honest boundary, per SECURITY_AND_FAILURE_REVIEW S6).** Admission
+guarantees a falsifier is *present*, not that it is *good*: a degenerate falsifier (`"."`) or an
+unfalsifiable-in-practice one (`"the heat death of the universe occurs"`) satisfies the letter of
+the rule. Falsifier *quality* is not machine-decidable and is deliberately not claimed here. What
+forces falsifiers to be real is the **mechanical-settlement razor** (D-021): a falsifier with no
+mechanical settlement source is flagged `interpretive` and scored in a separate calibration
+bucket. Until the razor ships, treat presence — not quality — as the enforced guarantee.
+
 ### 11.2 Resolutions (`memory.resolution/1`) — SCORE and RECONCILE
 
 Confidence is never asserted; it is the fold of resolutions:

@@ -25,7 +25,7 @@ pub fn ceiling_for(min_trust: Trust) -> EffectClass {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capability {
     pub id: String,
     pub task: String,

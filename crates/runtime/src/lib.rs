@@ -24,6 +24,50 @@ mod loop_tests {
     use std::fs;
     use substrate::Substrate;
 
+    // Regression for SECURITY_AND_FAILURE_REVIEW S1: an unrelated approval must
+    // NOT settle a hand-placed, general-scoped caution. This is the exact A5
+    // attack (approving a haiku falsified a "deleting prod data is catastrophic"
+    // premortem). Automated settlement now touches only premortems the task
+    // relied on AND the loop itself created.
+    #[test]
+    fn s1_unrelated_approval_does_not_settle_manual_caution() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join(".nexus");
+        let mut sub = Substrate::init(&data, "pass").unwrap();
+        let target = dir.path().join("proj");
+        fs::create_dir_all(&target).unwrap();
+
+        // A user hand-places a broad, safety-critical caution.
+        let caution = substrate::bets::place(
+            &mut sub,
+            substrate::event::Origin { adapter: "nx-cli".into(), actor: "user".into(), trust: substrate::event::Trust::User },
+            substrate::event::Privacy::P1,
+            vec![],
+            &substrate::bets::Bet {
+                statement: "deleting prod data is catastrophic".into(),
+                scope: "general".into(),
+                kind: substrate::bets::BetKind::Premortem,
+                stakes: "R3".into(),
+                falsifiers: vec!["a similar task is later approved without edits".into()],
+                horizon: None,
+                premises: vec![],
+            },
+        )
+        .unwrap();
+
+        // An unrelated task is run and approved.
+        let r = pipeline::run_intent(&data, &mut sub, "write a haiku", &target, true).unwrap();
+        let (_, settled) = inbox::approve(&data, &mut sub, &r.txn.unwrap()).unwrap();
+
+        assert!(settled.is_empty(), "no caution should be auto-settled: {settled:?}");
+        let v = substrate::bets::views(&sub).unwrap();
+        assert_eq!(
+            v.iter().find(|b| b.id == caution).unwrap().status,
+            "live",
+            "the hand-placed caution survives an unrelated approval"
+        );
+    }
+
     #[test]
     fn full_mock_loop_approve_applies_to_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -50,8 +94,9 @@ mod loop_tests {
         assert_eq!(items[0].verdict, "approve");
 
         // Approve → committed to target; inbox drains; states fold to done.
-        let applied = inbox::approve(&data, &mut sub, &txn).unwrap();
+        let (applied, settled) = inbox::approve(&data, &mut sub, &txn).unwrap();
         assert_eq!(applied, 1);
+        assert!(settled.is_empty(), "no premortems existed to settle");
         assert!(target.join("NOTES.md").exists());
         assert!(fs::read_to_string(target.join("NOTES.md")).unwrap().contains("capture this note"));
         assert!(inbox::list(&data, &sub).unwrap().is_empty());
@@ -102,7 +147,15 @@ mod loop_tests {
             "worker plan must acknowledge the premortem: {:?}",
             r2.plan
         );
-        inbox::approve(&data, &mut sub, &r2.txn.unwrap()).unwrap();
+        // Approval triggers the FIRST AUTOMATED SETTLEMENT: the premortem's
+        // stated falsifier ("a similar task is later approved") is met, so
+        // settlement.flow retires it — no human resolves anything.
+        let (_, settled) = inbox::approve(&data, &mut sub, &r2.txn.unwrap()).unwrap();
+        assert_eq!(settled, vec![bet_id.clone()]);
+        let views_after = substrate::bets::views(&sub).unwrap();
+        let premortem = views_after.iter().find(|v| v.id == bet_id).unwrap();
+        assert_eq!(premortem.status, "falsified");
+        assert!(premortem.terminal_note.as_deref().unwrap().contains("settlement.flow"));
         let notes = fs::read_to_string(target.join("NOTES.md")).unwrap();
         assert!(notes.contains("config lives in repo root"), "caution surfaced in the artifact");
 
@@ -126,8 +179,10 @@ mod loop_tests {
             .collect();
         assert!(inputs.contains(&bet_id.as_str()), "derivation must cite the bet it relied on");
 
-        // An out-of-scope bet does NOT enter the working set.
-        let other_scope = substrate::bets::place(
+        // Round 3: the settled premortem no longer enters working sets —
+        // settlement feeds back into retrieval. An out-of-scope premortem
+        // (control) must not leak in either.
+        substrate::bets::place(
             &mut sub,
             substrate::event::Origin {
                 adapter: "test".into(), actor: "tester".into(), trust: substrate::event::Trust::User,
@@ -147,10 +202,10 @@ mod loop_tests {
         .unwrap();
         let r3 = pipeline::run_intent(&data, &mut sub, "third task", &target, true).unwrap();
         assert!(
-            r3.plan.iter().any(|s| s.contains("heeding 1 caution")),
-            "still exactly one in-scope caution — the unrelated bet stayed out"
+            !r3.plan.iter().any(|s| s.contains("heeding")),
+            "settled premortem is out of retrieval and the unrelated one stayed out: {:?}",
+            r3.plan
         );
-        let _ = other_scope;
     }
 
     #[test]
@@ -184,5 +239,18 @@ mod loop_tests {
         assert!(bets[0].bet.statement.contains("not what I meant"));
         assert_eq!(bets[0].status, "live");
         assert!(!bets[0].bet.falsifiers.is_empty(), "premortems are falsifiable like any bet");
+        let first_premortem = bets[0].id.clone();
+
+        // A second rejection of a similar task is automated settlement in
+        // the other direction: the failure pattern recurred, the premortem
+        // scores `held` (+1, stays live) — and a fresh premortem is minted
+        // for the new reason.
+        let r2 = pipeline::run_intent(&data, &mut sub, "note again", &target, true).unwrap();
+        inbox::reject(&data, &mut sub, &r2.txn.unwrap(), "still not what I meant").unwrap();
+        let bets = substrate::bets::views(&sub).unwrap();
+        let first = bets.iter().find(|v| v.id == first_premortem).unwrap();
+        assert_eq!(first.held, 1, "recurring failure earned the premortem a held score");
+        assert_eq!(first.status, "live");
+        assert_eq!(bets.len(), 2, "new reason minted a second premortem");
     }
 }

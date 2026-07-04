@@ -5,6 +5,141 @@ changes design or code.
 
 ---
 
+## 2026-07-04 (session 20) — Fixed S1–S6 from the security review (FIXES.md)
+
+**Phase:** remediation. Architecture frozen; all changes local and additive, reusing existing
+machinery. 57/57 tests (was 51; +6 regression), demo 19/19, all four exploits confirmed closed.
+Full detail in FIXES.md.
+
+### What changed (smallest fix each; root causes in FIXES.md)
+- **S1 (settlement confusion)** — automated settlement now touches only premortems the task
+  **cited** (recorded on the Diff as `cited_premortems`, from the derivation working set) AND
+  the loop **created** (origin adapter `runtime.inbox`). Hand-placed cautions are never
+  auto-settled. Files: pipeline.rs, inbox.rs, bets.rs (`BetView.origin_adapter`).
+- **S2 (forget didn't retract)** — `Substrate::forget` now retracts live bets whose evidence is
+  entirely forgotten, via existing RECONCILE (cascades to dependents). Files: lib.rs, bets.rs
+  (`BetView.provenance`).
+- **S3 (trust laundering)** — consolidated bets inherit min provenance trust, capped at Derived;
+  external evidence → external belief. Files: consolidate.rs.
+- **S4 (forgeable txn meta)** — authoritative target + full capability written into the signed
+  `txn.begin/1` event (`capability_full`); commit re-derives from the record and refuses a
+  mismatched `meta.json`. Files: txn.rs, capability.rs (`Capability: PartialEq`).
+- **S5 (no contradiction detection)** — read-time lexical `bets::contradictions` (negation
+  parity); surfaced at `bet place` (⚠) and in `nx bets` (`[CONTRADICTS]`), never auto-resolved.
+  Files: bets.rs, main.rs.
+- **S6 (syntactic admission)** — doc honesty in specs/record.md §11.1 (admission guarantees
+  presence, not quality; razor forces quality). Boundary locked by a test.
+
+### Regression tests added
+`s1_unrelated_approval_does_not_settle_manual_caution` (runtime); `s2_forgetting_evidence_retracts_the_belief`,
+`s2_belief_with_other_evidence_survives_forget`, `s5_contradiction_is_surfaced`,
+`s6_degenerate_falsifier_is_accepted_documented_boundary` (substrate/bets);
+`s3_external_evidence_yields_external_belief` (runtime/consolidate);
+`tampered_meta_capability_is_rejected`, `tampered_meta_target_cannot_redirect_commit` (kernel/txn).
+
+### Verification
+`cargo test` 57/57; `bash demo/prove-it.sh` 19/19 exit 0; the four exploitable attacks (A5, A6,
+A7, A22c) re-run and confirmed closed. No new concepts; no redesign; backward compatible.
+
+---
+
+## 2026-07-04 (session 19) — External adversarial review: 6 attacks landed, 13 resisted
+
+**Phase:** external security/failure review. Empirical — every finding produced by running the
+`nx` binary against a fresh record, not by reading code. **No source modified** (architecture
+frozen); attacks used only the public CLI + filesystem. Deliverable:
+SECURITY_AND_FAILURE_REVIEW.md. Fixes proposed, not implemented.
+
+### Successful attacks (with smallest proposed fix — NOT applied)
+- **S1 (HIGH)** — automated settlement falsely retires unrelated cautions: `approve` settles ALL
+  in-scope live premortems, scope-match is coarse (`general` matches everything), similarity
+  never checked → an unrelated haiku approval "falsified" a catastrophic-data premortem, silencing
+  a safety caution. Fix: settle only premortems the task's derivation actually cited (data already
+  recorded).
+- **S2 (HIGH)** — `forget` an episode does not retract beliefs built on it: belief stays `live`
+  with dangling provenance; specs §7 promises this propagation, it's unimplemented. Epistemic +
+  privacy leak. Fix: retract evidence-less bets in the forget path via existing RECONCILE.
+- **S3 (HIGH)** — external-trust content launders into a `derived`-tagged belief and reaches the
+  worker's working set; the `external` taint is dropped at S0→S1, defeating the capability
+  ceiling's premise (action layer still contained by R1 txn + review). Fix: bet origin trust =
+  min trust of provenance episodes.
+- **S4 (HIGH, local-fs-scoped)** — transaction capability/target live in plaintext, unsigned
+  `txns/*/meta.json`; a consistent forge (target+scope, victim matching snapshot) redirected a
+  commit into an arbitrary dir, signed as legitimate. Fix: re-derive the authorizing capability
+  from the signed record by txn id; treat meta as a non-authoritative cache.
+- **S5 (MEDIUM)** — no contradiction detection between independent bets (both live forever);
+  RECONCILE only spans premise links. Fix: lexical near-dup-with-negation flag to a review queue.
+- **S6 (LOW/MED)** — admission is syntactic; degenerate falsifiers ("." / heat-death) pass.
+  Honest boundary; the (unimplemented) razor is what would force real falsifiers. Doc fix.
+
+### Resisted (13) — why the core held
+Concurrent-writer lock (no corruption); premise cycles impossible (immutable events + pre-exist
+check); terminal bets can't be revived; forged/nonexistent bet ids rejected; case/whitespace
+dedup; closed provider registry; oversized event rejected (OS-level caveat noted); bet scope is
+opaque (no traversal); `safe_join` path confinement; overlapping-txn drift detection; degenerate
+credential handling; per-frame BLAKE3 tamper detection.
+
+### Verdict
+The deterministic epistemic core (admission, immutability, resolution fold, premise RECONCILE,
+dedup, signed log) resisted all direct attack — the claimed invention survived. The six landings
+are on young/deferred edges (newest feature = settlement; the one component never moved into the
+signed record = txn meta) and two overstated doc claims. No redesign required; all five
+actionable fixes are local and reuse existing machinery (derivation manifests, RECONCILE,
+provenance, signed log). Fixes deliberately NOT applied this session per the review's mandate.
+
+### Next actions (recommended priority, if/when fixes are authorized)
+1. S1 (settle-what-was-cited) — highest impact, smallest change, corrupts beliefs in normal use.
+2. S4 (authority into the signed record) — closes the forgeable-authorization hole.
+3. S2 (forget→retract) + S3 (trust propagation) — restore the two laundering/leak gaps.
+4. S5/S6 — surfacing + doc honesty.
+
+---
+
+## 2026-07-04 (session 18) — Phase 1 gate items: sweeper, automated settlement, fallback routing, demo v2
+
+**Phase:** Phase 1 completion under frozen architecture. 50/50 unit tests; demo 19/19.
+
+### Done
+- **Horizon sweeper** (`bets::sweep_horizons`, gate item): read-time expiries become ledgered
+  `expired` resolutions (`by: sweeper`); idempotent; runs first in every `nx consolidate`.
+  `BetView.read_time_expired` distinguishes the sweeper's queue from ledgered truth.
+- **First automated settlement** (gate item, in `inbox`): approval of a similar in-scope task
+  mechanically meets every flow-born premortem's stated falsifier → `settlement.flow` resolves
+  it **falsified** (the razor: settle by the letter of the contract, even against the system's
+  own convenience — if the failure recurs, a rejection mints a fresh premortem). Symmetric:
+  a rejection of a similar task resolves in-scope premortems **held** (+1, live). Settlement
+  demonstrably feeds back: a settled caution leaves future working sets (tested + demoed).
+- **Writer lock** (D-021 fix 3a): exclusive `fs2` lock on the record; second process refused;
+  released on process death. Tests adjusted for single-writer discipline.
+- **Hugging Face provider** (constraint list): OpenAI-compat via `router.huggingface.co/v1`,
+  `HF_TOKEN`, registry now 9 providers.
+- **Fallback routing** (`RouteRule.fallbacks`): preference-ordered candidates; skip
+  unavailable (no key), abandon on call failure, every attempt logged with its index; local-
+  first is a user preference expressed in ordering. Measured cost/latency selection stays
+  deferred per D-016 — availability + preference only, nothing pretended.
+- **Demo v2 + DEMO.md** (gate item): 9 acts, 19 assertions, exit-nonzero, fresh record,
+  deterministic mock; now covers the full belief lifecycle: admission → scoring → loss →
+  cascade → litmus (`--lost`) → behavior with controls → **automated settlement + feedback**
+  → evidence traceability (consolidated belief cites its episode) → horizon sweep → signed/
+  tamper-evident receipts. Every run regenerates `DEMO.md`, an annotated transcript.
+- **Real-model execution attempted** (gate item): an `OPENAI_API_KEY` present in this
+  environment turned out invalid (401 on `/models`). The attempt fully exercised the real
+  path — sealed-key configure, live HTTP, auth header, failure surfaced through the fallback
+  chain report. **Machinery proven; still blocked on a valid credential.** (Key fragments were
+  not printed; validity checked by HTTP status only.)
+
+### Phase 1 gate status
+Automated-settlement and ≥10-unauthored-bets machinery: done and demonstrated. The pilot-usage
+metrics (≥5 delegated tasks/week, review times) and the live-model run await a real user with
+a valid key — the remaining gate items are usage, not code.
+
+### Next actions
+1. [A] Real-model run with a valid key (`nx configure`, then the demo tasks without `--mock`).
+2. [P] D-021 fixes continued: `committing` intent state + op_id recovery; then credence field
+   + reliability rename (spec 0.3); sealed derived caches + 10⁶-event benchmark.
+
+---
+
 ## 2026-07-04 (session 17) — Pre-publication design review: 5 objections, 3 fully valid (D-021)
 
 **Phase:** hostile technical review (fundamental correctness only), simulating principal

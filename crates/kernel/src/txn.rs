@@ -135,6 +135,9 @@ impl TxnManager {
         };
         self.save(&meta)?;
 
+        // The authoritative target and capability live in the signed record,
+        // not the plaintext meta (S4): commit re-derives them from here, so a
+        // forged meta.json cannot redirect a commit or escalate authority.
         let body = crate::ledger::sign_body(
             sub,
             serde_json::json!({
@@ -142,6 +145,7 @@ impl TxnManager {
                 "target": target.to_string_lossy(),
                 "files_snapshotted": meta.manifest.len(),
                 "capability": meta.capability.id,
+                "capability_full": serde_json::to_value(&meta.capability)?,
             }),
         )?;
         sub.append(
@@ -210,11 +214,45 @@ impl TxnManager {
         Ok((meta, changes, drift))
     }
 
+    /// Authoritative target + capability for a transaction, read from the
+    /// signed `txn.begin/1` event in the record — the tamper-evident source of
+    /// truth (S4). The plaintext `meta.json` is only a cache; commit trusts
+    /// this, not that.
+    fn authoritative(&self, sub: &Substrate, id: &str) -> Result<(PathBuf, Capability)> {
+        let (events, _) = sub.events(true)?;
+        for e in &events {
+            if e.header.schema != TXN_BEGIN {
+                continue;
+            }
+            let substrate::BodyState::Plain(b) = &e.body else { continue };
+            let v: serde_json::Value = serde_json::from_slice(b)?;
+            if v["txn"].as_str() != Some(id) {
+                continue;
+            }
+            let target = PathBuf::from(
+                v["target"].as_str().context("begin event missing target")?,
+            );
+            let capability: Capability = serde_json::from_value(v["capability_full"].clone())
+                .context("begin event missing capability")?;
+            return Ok((target, capability));
+        }
+        bail!("no signed begin event for transaction {id} — refusing to commit")
+    }
+
     /// Apply the effect list to the target: drift check, then per-change
     /// capability check (R1, exercise-time) and a `ledger.effect/1` event per
     /// applied change, then `txn.commit/1`.
     pub fn commit(&self, sub: &mut Substrate, id: &str) -> Result<Vec<Change>> {
+        // S4: the meta.json on disk is untrusted. Re-derive target and
+        // capability from the signed record and refuse if the cache disagrees.
+        let (auth_target, auth_cap) = self.authoritative(sub, id)?;
         let (mut meta, changes, drift) = self.diff(id)?;
+        if meta.target != auth_target || meta.capability != auth_cap {
+            bail!(
+                "transaction metadata does not match the signed record — refusing to commit \
+                 (meta.json was tampered)"
+            );
+        }
         if !drift.is_empty() {
             bail!(
                 "target drifted since snapshot — refusing to commit:\n  {}",
@@ -454,18 +492,38 @@ mod tests {
         assert!(mgr.diff(&meta.id).is_err(), "aborted txn is closed");
     }
 
+    // Regression for SECURITY_AND_FAILURE_REVIEW S4: the plaintext meta.json
+    // is not authoritative. Any edit to its capability or target is caught by
+    // cross-check against the signed begin event. (Capability expiry itself is
+    // enforced at the capability layer — see capability::tests.)
     #[test]
-    fn expired_capability_blocks_commit() {
+    fn tampered_meta_capability_is_rejected() {
         let (_dir, mut sub, mgr, target) = setup();
         let meta = mgr.begin(&mut sub, &target).unwrap();
         fs::write(mgr.workspace(&meta.id).join("a.txt"), "late").unwrap();
-        // Force-expire the transaction's capability on disk.
+        // Forge the on-disk capability (escalate effect, extend expiry).
         let mut m = mgr.load(&meta.id).unwrap();
-        m.capability.expiry = Utc::now() - Duration::seconds(1);
+        m.capability.max_effect = EffectClass::R3;
+        m.capability.expiry = Utc::now() + Duration::days(3650);
         mgr.save(&m).unwrap();
         let err = mgr.commit(&mut sub, &meta.id).unwrap_err();
-        assert!(format!("{err:#}").contains("capability"), "{err:#}");
-        // Nothing applied.
+        assert!(format!("{err:#}").contains("signed record"), "{err:#}");
         assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "alpha");
+    }
+
+    // Regression for S4: forging meta.target to redirect the write is caught.
+    #[test]
+    fn tampered_meta_target_cannot_redirect_commit() {
+        let (dir, mut sub, mgr, target) = setup();
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let meta = mgr.begin(&mut sub, &target).unwrap();
+        fs::write(mgr.workspace(&meta.id).join("payload.txt"), "pwned").unwrap();
+        let mut m = mgr.load(&meta.id).unwrap();
+        m.target = victim.canonicalize().unwrap();
+        m.capability.scope = vec![victim.to_string_lossy().into_owned()];
+        mgr.save(&m).unwrap();
+        assert!(mgr.commit(&mut sub, &meta.id).is_err());
+        assert!(!victim.join("payload.txt").exists(), "write must not reach victim");
     }
 }

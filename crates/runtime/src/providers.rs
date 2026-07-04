@@ -35,8 +35,9 @@ pub trait Provider {
 }
 
 /// All known provider ids, in onboarding display order.
-pub const PROVIDER_IDS: [&str; 8] = [
-    "anthropic", "openai", "gemini", "openrouter", "ollama", "lmstudio", "openai-compat", "mock",
+pub const PROVIDER_IDS: [&str; 9] = [
+    "anthropic", "openai", "gemini", "openrouter", "ollama", "lmstudio", "huggingface",
+    "openai-compat", "mock",
 ];
 
 pub fn get(id: &str) -> Result<Box<dyn Provider>> {
@@ -67,6 +68,12 @@ pub fn get(id: &str) -> Result<Box<dyn Provider>> {
             env: None,
             needs_key: false,
         }),
+        "huggingface" => Box::new(OpenAiCompat {
+            id: "huggingface",
+            default_base: "https://router.huggingface.co/v1",
+            env: Some("HF_TOKEN"),
+            needs_key: true,
+        }),
         "openai-compat" => Box::new(OpenAiCompat {
             id: "openai-compat",
             default_base: "",
@@ -87,6 +94,7 @@ pub fn suggested_model(id: &str) -> &'static str {
         "openrouter" => "anthropic/claude-sonnet-5",
         "ollama" => "llama3.3",
         "lmstudio" => "local-model",
+        "huggingface" => "meta-llama/Llama-3.3-70B-Instruct",
         _ => "",
     }
 }
@@ -323,6 +331,7 @@ mod tests {
         assert!(get("openai").unwrap().needs_key());
         assert!(get("gemini").unwrap().needs_key());
         assert!(get("openrouter").unwrap().needs_key());
+        assert!(get("huggingface").unwrap().needs_key());
         assert!(!get("ollama").unwrap().needs_key());
         assert!(!get("lmstudio").unwrap().needs_key());
         assert!(!get("mock").unwrap().needs_key());

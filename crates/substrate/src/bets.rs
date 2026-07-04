@@ -93,6 +93,16 @@ pub struct BetView {
     pub unjustified: bool,
     /// For terminal bets: what killed it (the resolution note + who resolved).
     pub terminal_note: Option<String>,
+    /// Horizon passed but no resolution event exists yet — the sweeper's
+    /// work queue (read-time expiry is a view; the ledger entry is truth).
+    pub read_time_expired: bool,
+    /// Evidence episode ids (the bet event's refs). Used to retract beliefs
+    /// whose evidence is forgotten (S2).
+    pub provenance: Vec<String>,
+    /// Adapter that placed the bet (e.g. "runtime.inbox" for flow-born
+    /// premortems, "nx-cli" for hand-placed). Used to scope automated
+    /// settlement to the loop's own bets (S1).
+    pub origin_adapter: String,
 }
 
 /// Place a bet. The admission rule and stakes taxonomy are enforced here —
@@ -238,6 +248,9 @@ pub fn views(sub: &Substrate) -> Result<Vec<BetView>> {
                             falsified_count: 0,
                             unjustified: false,
                             terminal_note: None,
+                            read_time_expired: false,
+                            provenance: e.header.refs.clone(),
+                            origin_adapter: e.header.origin.adapter.clone(),
                         },
                     );
                 }
@@ -271,11 +284,72 @@ pub fn views(sub: &Substrate) -> Result<Vec<BetView>> {
                 if h < now {
                     v.status = "expired".into();
                     v.terminal_note = Some("horizon passed unresolved (read-time expiry)".into());
+                    v.read_time_expired = true;
                 }
             }
         }
     }
     Ok(out)
+}
+
+const NEGATIONS: [&str; 9] =
+    ["not", "never", "no", "cannot", "cant", "wont", "dont", "without", "nor"];
+
+/// Normalize a statement to (content-words-without-negation, negation-parity).
+/// Each negation word (and each `n't` contraction) flips the parity; the
+/// content words with negations removed form the comparison key.
+fn negation_signature(statement: &str) -> (String, bool) {
+    let lower = statement.to_lowercase();
+    let mut parity = lower.matches("n't").count() % 2 == 1;
+    let mut words: Vec<String> = Vec::new();
+    for w in lower.split(|c: char| !c.is_alphanumeric()) {
+        if w.is_empty() {
+            continue;
+        }
+        if NEGATIONS.contains(&w) {
+            parity = !parity;
+        } else {
+            words.push(w.to_string());
+        }
+    }
+    (words.join(" "), parity)
+}
+
+/// Surface (never auto-resolve) direct contradictions among live bets: pairs
+/// whose statements share the same content but opposite negation parity
+/// (S5). Lexical only — semantic contradiction stays an open problem
+/// (RESEARCH_NOTES). Computed at read time; nothing stored.
+pub fn contradictions(sub: &Substrate) -> Result<Vec<(String, String)>> {
+    let live: Vec<BetView> = views(sub)?.into_iter().filter(|v| v.status == "live").collect();
+    let mut out = Vec::new();
+    for i in 0..live.len() {
+        let (ci, pi) = negation_signature(&live[i].bet.statement);
+        if ci.is_empty() {
+            continue;
+        }
+        for j in (i + 1)..live.len() {
+            let (cj, pj) = negation_signature(&live[j].bet.statement);
+            if ci == cj && pi != pj {
+                out.push((live[i].id.clone(), live[j].id.clone()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The horizon sweeper (Phase 1 gate item): turn read-time expiries into
+/// ledgered `expired` resolutions. Idempotent — a swept bet has a resolution
+/// event and stops reading as `read_time_expired`.
+pub fn sweep_horizons(sub: &mut Substrate) -> Result<Vec<String>> {
+    let due: Vec<String> = views(sub)?
+        .into_iter()
+        .filter(|v| v.read_time_expired)
+        .map(|v| v.id)
+        .collect();
+    for id in &due {
+        append_resolution(sub, id, Outcome::Expired, "horizon passed", "sweeper")?;
+    }
+    Ok(due)
 }
 
 #[cfg(test)]
@@ -297,6 +371,68 @@ mod tests {
             horizon: None,
             premises,
         }
+    }
+
+    // Regression for SECURITY_AND_FAILURE_REVIEW S6: admission guarantees a
+    // falsifier is PRESENT, not GOOD — a degenerate "." is deliberately
+    // accepted (documented boundary; quality is the razor's job, not
+    // admission's). This test locks the boundary so a future "reject short
+    // falsifiers" hack doesn't silently overclaim.
+    #[test]
+    fn s6_degenerate_falsifier_is_accepted_documented_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = Substrate::init(dir.path(), "pass").unwrap();
+        assert!(place(&mut sub, origin(), Privacy::P1, vec![], &bet("moon is cheese", vec!["."], vec![])).is_ok());
+    }
+
+    // Regression for S5: two live bets with opposite negation parity over the
+    // same content are surfaced as a contradiction (never auto-resolved).
+    #[test]
+    fn s5_contradiction_is_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = Substrate::init(dir.path(), "pass").unwrap();
+        let a = place(&mut sub, origin(), Privacy::P1, vec![], &bet("the deploy window is friday", vec!["x"], vec![])).unwrap();
+        let b = place(&mut sub, origin(), Privacy::P1, vec![], &bet("the deploy window is never friday", vec!["x"], vec![])).unwrap();
+        place(&mut sub, origin(), Privacy::P1, vec![], &bet("unrelated belief", vec!["x"], vec![])).unwrap();
+        let c = contradictions(&sub).unwrap();
+        assert_eq!(c.len(), 1, "exactly the negation pair: {c:?}");
+        assert!((c[0].0 == a && c[0].1 == b) || (c[0].0 == b && c[0].1 == a));
+        // Both remain live — surfaced, not resolved.
+        let views = views(&sub).unwrap();
+        assert!(views.iter().filter(|v| v.id == a || v.id == b).all(|v| v.status == "live"));
+    }
+
+    // Regression for S2: forgetting a belief's sole evidence retracts it.
+    #[test]
+    fn s2_forgetting_evidence_retracts_the_belief() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = Substrate::init(dir.path(), "pass").unwrap();
+        let ep = sub
+            .append(Kind::Observation, "dev.note/1", origin(), Privacy::P1, vec![], b"I prefer tabs")
+            .unwrap();
+        let id = place(&mut sub, origin(), Privacy::P1, vec![ep.id.clone()], &bet("user prefers tabs", vec!["a space is chosen"], vec![])).unwrap();
+        // A dependent belief must cascade to unjustified when the base retracts.
+        let dep = place(&mut sub, origin(), Privacy::P1, vec![], &bet("configure the editor for tabs", vec!["x"], vec![id.clone()])).unwrap();
+        assert_eq!(views(&sub).unwrap().iter().find(|v| v.id == id).unwrap().status, "live");
+
+        assert!(sub.forget(&ep.id).unwrap());
+
+        let v = views(&sub).unwrap();
+        assert_eq!(v.iter().find(|b| b.id == id).unwrap().status, "retracted", "belief lost its only evidence");
+        assert!(v.iter().find(|b| b.id == dep).unwrap().unjustified, "dependent cascaded");
+    }
+
+    // Regression for S2 (guard): a belief with OTHER surviving evidence is NOT
+    // retracted when one episode is forgotten.
+    #[test]
+    fn s2_belief_with_other_evidence_survives_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = Substrate::init(dir.path(), "pass").unwrap();
+        let e1 = sub.append(Kind::Observation, "n/1", origin(), Privacy::P1, vec![], b"src1").unwrap();
+        let e2 = sub.append(Kind::Observation, "n/1", origin(), Privacy::P1, vec![], b"src2").unwrap();
+        let id = place(&mut sub, origin(), Privacy::P1, vec![e1.id.clone(), e2.id.clone()], &bet("two-sourced belief", vec!["x"], vec![])).unwrap();
+        assert!(sub.forget(&e1.id).unwrap());
+        assert_eq!(views(&sub).unwrap().iter().find(|v| v.id == id).unwrap().status, "live");
     }
 
     #[test]
@@ -360,5 +496,29 @@ mod tests {
         b.horizon = Some(Utc::now() - chrono::Duration::hours(1));
         place(&mut sub, origin(), Privacy::P1, vec![], &b).unwrap();
         assert_eq!(views(&sub).unwrap()[0].status, "expired");
+    }
+
+    #[test]
+    fn sweeper_ledgers_expiry_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = Substrate::init(dir.path(), "pass").unwrap();
+        let mut b = bet("goes stale", vec!["still true next week"], vec![]);
+        b.horizon = Some(Utc::now() - chrono::Duration::hours(1));
+        place(&mut sub, origin(), Privacy::P1, vec![], &b).unwrap();
+
+        // Before sweep: expired at read time only, no ledger entry.
+        let v = &views(&sub).unwrap()[0];
+        assert!(v.read_time_expired);
+
+        let swept = sweep_horizons(&mut sub).unwrap();
+        assert_eq!(swept.len(), 1);
+
+        // After sweep: the expiry is a resolution event; view no longer
+        // read-time; second sweep finds nothing.
+        let v = &views(&sub).unwrap()[0];
+        assert_eq!(v.status, "expired");
+        assert!(!v.read_time_expired);
+        assert_eq!(v.terminal_note.as_deref(), Some("horizon passed (by sweeper)"));
+        assert!(sweep_horizons(&mut sub).unwrap().is_empty());
     }
 }

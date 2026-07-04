@@ -476,8 +476,11 @@ fn main() -> Result<()> {
         }
         Cmd::Approve { txn } => {
             let mut s = Substrate::open(&cli.data, &pass)?;
-            let n = runtime::inbox::approve(&cli.data, &mut s, txn)?;
+            let (n, settled) = runtime::inbox::approve(&cli.data, &mut s, txn)?;
             println!("approved: {n} effects applied and ledgered");
+            for id in &settled {
+                println!("auto-settled: premortem {id} falsified (its stated falsifier was met by this approval)");
+            }
         }
         Cmd::Reject { txn, reason } => {
             let mut s = Substrate::open(&cli.data, &pass)?;
@@ -517,6 +520,9 @@ fn main() -> Result<()> {
         Cmd::Consolidate { mock } => {
             let mut s = Substrate::open(&cli.data, &pass)?;
             let r = runtime::consolidate::run(&cli.data, &mut s, *mock)?;
+            if !r.swept.is_empty() {
+                println!("swept {} expired horizon(s) into the ledger", r.swept.len());
+            }
             println!(
                 "scanned {} episodes → {} candidates → {} placed, {} duplicates, {} rejected",
                 r.scanned, r.candidates, r.placed.len(), r.duplicates, r.rejected.len()
@@ -548,11 +554,19 @@ fn main() -> Result<()> {
                 if views.is_empty() {
                     println!("no bets placed");
                 }
+                // S5: surface (never resolve) direct contradictions.
+                let contra = substrate::bets::contradictions(&s)?;
+                let contra_of = |id: &str| -> Option<String> {
+                    contra.iter().find_map(|(a, b)| {
+                        if a == id { Some(b.clone()) } else if b == id { Some(a.clone()) } else { None }
+                    })
+                };
                 for v in &views {
                     let flag = if v.unjustified { "  [UNJUSTIFIED]" } else { "" };
+                    let cf = contra_of(&v.id).map(|o| format!("  [CONTRADICTS {o}]")).unwrap_or_default();
                     println!(
-                        "{}  {:?}/{}  {}  held:{} falsified:{}{}",
-                        v.id, v.bet.kind, v.bet.stakes, v.status, v.held, v.falsified_count, flag
+                        "{}  {:?}/{}  {}  held:{} falsified:{}{}{}",
+                        v.id, v.bet.kind, v.bet.stakes, v.status, v.held, v.falsified_count, flag, cf
                     );
                     println!("    {}", v.bet.statement);
                     for f in &v.bet.falsifiers {
@@ -587,6 +601,13 @@ fn main() -> Result<()> {
                         },
                     )?;
                     println!("{id}");
+                    // S5: surface a contradiction with an existing live belief.
+                    for (a, b) in substrate::bets::contradictions(&s)? {
+                        if a == id || b == id {
+                            let other = if a == id { &b } else { &a };
+                            eprintln!("⚠ possible contradiction with live bet {other} — surfaced, not resolved");
+                        }
+                    }
                 }
                 BetCmd::Resolve { id, outcome, note } => {
                     let outcome = substrate::bets::Outcome::parse(outcome)?;

@@ -54,6 +54,7 @@ pub fn apply(data_dir: &Path, sub: &mut Substrate, choice: &ProviderChoice) -> R
                 model: choice.model.trim().to_string(),
                 max_tokens: if tc == "worker.execute" { 8192 } else { 4096 },
                 base_url: choice.base_url.clone().filter(|b| !b.trim().is_empty()),
+                fallbacks: vec![],
             },
         );
     }

@@ -73,13 +73,16 @@ Skeptical? Run it:
 bash demo/prove-it.sh
 ```
 
-Thirteen self-asserting checks on a fresh record, with a deterministic mock standing in for
+Nineteen self-asserting checks on a fresh record, with a deterministic mock standing in for
 the AI so nothing can be attributed to model magic: unfalsifiable beliefs refused at write,
 scores earned from events, a belief killed by evidence with the cascade flagging everything
 built on it, `nx bets --lost` answering *"what did you believe that died, and what killed
 it,"* a rejection changing the next task's plan (with in-scope/out-of-scope controls),
-judgments citing the exact memories they relied on, and 4 flipped bytes anywhere in the log
-causing hard failure. Exits nonzero if any claim doesn't hold.
+**automated settlement** (an approval mechanically retires the premortem whose falsifier it
+meets — and the settled caution provably leaves future working sets), consolidated beliefs
+citing their evidence episodes, the horizon sweeper ledgering stale beliefs, and 4 flipped
+bytes anywhere in the log causing hard failure. Exits nonzero if any claim doesn't hold, and
+writes [DEMO.md](DEMO.md) — an annotated transcript of every step.
 
 ## Quick start
 

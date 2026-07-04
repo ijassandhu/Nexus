@@ -34,6 +34,9 @@ pub struct Substrate {
     keyring: Keyring,
     log: SegmentLog,
     identity: Option<Identity>,
+    /// Exclusive writer lock on the record (D-021 fix 3a). Released on drop
+    /// or process death — a crashed process never wedges the record.
+    _lock: fs::File,
 }
 
 /// A read-out event: header plus body state.
@@ -70,6 +73,12 @@ impl Substrate {
     pub fn open(dir: &Path, passphrase: &str) -> Result<Self> {
         let salt = fs::read(dir.join("keyring").join("salt"))
             .context("no record here — run `nx init` first")?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(dir.join("lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .map_err(|_| anyhow::anyhow!("record is in use by another process"))?;
         let kek = Kek::derive(passphrase, &salt)?;
         let keyring = Keyring::open(&dir.join("keyring"))?;
         let log = SegmentLog::open(&dir.join("log"))?;
@@ -79,6 +88,7 @@ impl Substrate {
             keyring,
             log,
             identity: None,
+            _lock: lock,
         })
     }
 
@@ -156,8 +166,11 @@ impl Substrate {
         })
     }
 
-    /// Forget per specs/record.md §7: shred the wrapped DEK, then append a
-    /// tombstone referencing id and body_hash only — never content.
+    /// Forget per specs/record.md §7: shred the wrapped DEK, append a
+    /// tombstone referencing id and body_hash only (never content), then
+    /// **retract any live bet whose evidence is now entirely gone** (S2) —
+    /// the episode→belief edge the spec promised. Retraction reuses RECONCILE,
+    /// so dependents of the retracted belief cascade to unjustified.
     pub fn forget(&mut self, id: &str) -> Result<bool> {
         let (records, _) = self.log.read_all()?;
         let Some(target) = records.iter().find(|r| r.header.id == id) else {
@@ -182,6 +195,25 @@ impl Substrate {
             vec![id.to_string()],
             tombstone.to_string().as_bytes(),
         )?;
+
+        // A belief citing the forgotten episode whose every evidence episode
+        // is now forgotten has lost its grounding — retract it.
+        let orphaned: Vec<String> = bets::views(self)?
+            .into_iter()
+            .filter(|b| b.status == "live")
+            .filter(|b| b.provenance.iter().any(|p| p == id))
+            .filter(|b| b.provenance.iter().all(|p| self.keyring.get(p).is_none()))
+            .map(|b| b.id)
+            .collect();
+        for bet_id in orphaned {
+            bets::resolve(
+                self,
+                &bet_id,
+                bets::Outcome::Retracted,
+                "all supporting evidence was forgotten",
+                "forget",
+            )?;
+        }
         Ok(true)
     }
 
@@ -236,6 +268,9 @@ mod tests {
         let mut s = Substrate::init(dir.path(), "right").unwrap();
         s.append(Kind::Observation, "dev.note/1", origin(), Privacy::P1, vec![], b"secret")
             .unwrap();
+        // Writer lock: a second open while the first is alive is refused.
+        assert!(Substrate::open(dir.path(), "wrong").is_err());
+        drop(s);
         let s2 = Substrate::open(dir.path(), "wrong").unwrap();
         assert!(s2.events(true).is_err());
     }
@@ -255,11 +290,11 @@ mod tests {
         assert_eq!(events[1].header.schema, FORGET_SCHEMA);
         assert_eq!(events[1].header.refs, vec![h.id.clone()]);
         // Reopen from disk: still forgotten (shred survived persistence).
-        let s2 = Substrate::open(dir.path(), "pass").unwrap();
+        drop(s);
+        let mut s2 = Substrate::open(dir.path(), "pass").unwrap();
         let (events, _) = s2.events(true).unwrap();
         assert!(matches!(events[0].body, BodyState::Forgotten));
         // Forgetting twice is a no-op, not an error.
-        let mut s2 = s2;
         assert!(!s2.forget(&h.id).unwrap());
     }
 
