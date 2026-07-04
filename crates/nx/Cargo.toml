@@ -1,0 +1,20 @@
+[package]
+name = "nx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NEXUS CLI (Phase 0 walking skeleton)"
+
+[[bin]]
+name = "nx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+substrate = { path = "../substrate" }
+kernel = { path = "../kernel" }
+runtime = { path = "../runtime" }
+rpassword = "7"
